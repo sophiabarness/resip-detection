@@ -1,0 +1,1 @@
+sudo nsenter -t <pid> -n tcpdump -i any -nn -tt -s 256 -c 100000 -w /tmp/capture.pcap
