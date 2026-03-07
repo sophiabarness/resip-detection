@@ -5,7 +5,7 @@ Analyze a pcap file to classify and characterize residential proxy traffic.
 Given a proxy IP, classifies remote IPs into gateway servers vs. proxied
 destinations, then produces findings on:
 
-  1. IP classification (gateway vs destination)
+  1. IP classification (gateway vs. destination)
   2. Destination distribution (what services are being accessed)
   3. Geolocation of destination IPs
   4. Gateway vs destination traffic volume ratio
@@ -15,6 +15,7 @@ destinations, then produces findings on:
   8. TLS fingerprint diversity
   9. UDP tunnel packet size distribution
   10. DNS query analysis
+  11. Connection security
 
 Usage:
   python3 analyze_pcap.py [--pcap FILE] [--proxy-ip IP] [--no-geo]
@@ -142,73 +143,113 @@ def classify_ips(pcap, proxy_ip):
 
 
 # ---------------------------------------------------------------------------
-# Finding 2: Destination distribution (services)
+# IP enrichment: ASN + geolocation (shared by Findings 2 and 3)
 # ---------------------------------------------------------------------------
 
-def analyze_destination_distribution(destinations):
-    """Summarize destination IPs by known service/CDN based on IP ranges."""
-    # Simple heuristic mapping of well-known IP ranges to services
-    known_prefixes = [
-        ("142.250.", "Google"),
-        ("172.217.", "Google"),
-        ("216.58.", "Google"),
-        ("104.16.", "Cloudflare"),
-        ("104.26.", "Cloudflare"),
-        ("172.64.", "Cloudflare"),
-        ("172.67.", "Cloudflare"),
-        ("151.101.", "Fastly (Reddit/StackOverflow/etc)"),
-        ("23.67.", "Akamai"),
-        ("23.37.", "Akamai"),
-        ("23.40.", "Akamai"),
-        ("23.227.", "Shopify"),
-        ("96.16.", "Akamai"),
-        ("69.192.", "Akamai"),
-        ("13.249.", "Amazon CloudFront"),
-        ("52.223.", "Amazon"),
-        ("98.82.", "Amazon"),
-        ("173.234.", "Proxy/VPN provider range"),
-        ("162.251.", "Hosting provider"),
-    ]
+def enrich_ips(ips, skip_geo=False):
+    """Look up ASN and geolocation for a list of IPs.
 
-    service_counts = Counter()
-    service_packets = Counter()
-    service_ips = defaultdict(list)
-    unmatched = []
+    Returns a dict mapping IP -> {asn, as_name, country, countryCode, city, org}.
+    Uses ip-api.com batch API when geo is enabled; falls back to Team Cymru
+    DNS for ASN-only lookups when --no-geo is set.
+    """
+    result = {}
+
+    if not skip_geo:
+        # ip-api.com batch (up to 100 IPs) — returns ASN + geo in one call
+        payload = json.dumps([{"query": ip} for ip in ips]).encode()
+        req = urllib.request.Request(
+            "http://ip-api.com/batch?fields=query,country,countryCode,city,org,as",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                for entry in json.loads(resp.read()):
+                    ip = entry.get("query", "")
+                    as_field = entry.get("as", "")
+                    # Parse "AS15169 Google LLC" into number and name
+                    asn, as_name = "", as_field
+                    if as_field.startswith("AS"):
+                        parts = as_field.split(" ", 1)
+                        asn = parts[0]
+                        as_name = parts[1] if len(parts) > 1 else asn
+                    result[ip] = {
+                        "asn": asn,
+                        "as_name": as_name,
+                        "as_full": as_field,
+                        "country": entry.get("country", ""),
+                        "countryCode": entry.get("countryCode", ""),
+                        "city": entry.get("city", ""),
+                        "org": entry.get("org", ""),
+                    }
+        except (urllib.error.URLError, TimeoutError) as e:
+            print(f"  (ip-api.com lookup failed: {e}; falling back to DNS)", file=sys.stderr)
+            skip_geo = True  # fall through to Cymru below
+
+    if skip_geo:
+        # Team Cymru DNS-based ASN lookup (stdlib only, no API key needed).
+        # Query: reversed-IP.origin.asn.cymru.com TXT
+        # Response: "ASN | prefix | CC | rir | date"
+        import subprocess as _sp
+        for ip in ips:
+            rev = ".".join(reversed(ip.split(".")))
+            hostname = f"{rev}.origin.asn.cymru.com"
+            try:
+                out = _sp.run(
+                    ["dig", "+short", "TXT", hostname],
+                    capture_output=True, text=True, timeout=5,
+                ).stdout.strip().strip('"')
+                # e.g. "15169 | 142.250.189.0/24 | US | arin | 2012-05-24"
+                parts = [p.strip() for p in out.split("|")]
+                asn_num = parts[0] if parts else ""
+                cc = parts[2] if len(parts) > 2 else ""
+                asn = f"AS{asn_num}" if asn_num else ""
+
+                # Resolve ASN to name via ASN.asn.cymru.com
+                as_name = asn
+                if asn_num:
+                    name_out = _sp.run(
+                        ["dig", "+short", "TXT", f"AS{asn_num}.asn.cymru.com"],
+                        capture_output=True, text=True, timeout=5,
+                    ).stdout.strip().strip('"')
+                    # e.g. "15169 | US | arin | 2000-03-30 | GOOGLE, US"
+                    name_parts = [p.strip() for p in name_out.split("|")]
+                    if len(name_parts) >= 5:
+                        as_name = name_parts[4]
+
+                result[ip] = {
+                    "asn": asn,
+                    "as_name": as_name,
+                    "as_full": f"{asn} {as_name}",
+                    "country": "",
+                    "countryCode": cc,
+                    "city": "",
+                    "org": "",
+                }
+            except Exception:
+                result[ip] = {
+                    "asn": "", "as_name": "(lookup failed)", "as_full": "",
+                    "country": "", "countryCode": "", "city": "", "org": "",
+                }
+
+    return result
+
+
+def analyze_destination_distribution(destinations, ip_info):
+    """Summarize destination IPs by ASN."""
+    asn_counts = Counter()
+    asn_packets = Counter()
+    asn_ips = defaultdict(list)
 
     for ip, entry in sorted(destinations.items(), key=lambda x: -x[1]["total_packets"]):
-        matched = False
-        for prefix, service in known_prefixes:
-            if ip.startswith(prefix):
-                service_counts[service] += 1
-                service_packets[service] += entry["total_packets"]
-                service_ips[service].append(ip)
-                matched = True
-                break
-        if not matched:
-            unmatched.append(entry)
+        info = ip_info.get(ip, {})
+        as_label = info.get("as_full", "") or "(unknown)"
+        asn_counts[as_label] += 1
+        asn_packets[as_label] += entry["total_packets"]
+        asn_ips[as_label].append(ip)
 
-    return service_counts, service_packets, service_ips, unmatched
-
-
-# ---------------------------------------------------------------------------
-# Finding 3: Geolocation
-# ---------------------------------------------------------------------------
-
-def geolocate_ips(ips):
-    """Geolocate a list of IPs using ip-api.com batch endpoint (free, no key)."""
-    # ip-api.com allows batches of up to 100
-    payload = json.dumps([{"query": ip} for ip in ips]).encode()
-    req = urllib.request.Request(
-        "http://ip-api.com/batch?fields=query,country,countryCode,city,org,as",
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read())
-    except (urllib.error.URLError, TimeoutError) as e:
-        print(f"  (geolocation failed: {e})", file=sys.stderr)
-        return []
+    return asn_counts, asn_packets, asn_ips
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +471,35 @@ def analyze_udp_sizes(pcap, proxy_ip, gateways):
     }
 
 
+
+
+# ---------------------------------------------------------------------------
+# Finding 10: DNS query analysis
+# ---------------------------------------------------------------------------
+
+def analyze_dns(pcap):
+    """Extract DNS queries and responses."""
+    rows = run_tshark(
+        pcap,
+        ["dns.qry.name", "dns.flags.response", "dns.a"],
+        display_filter="dns",
+    )
+
+    queries = defaultdict(lambda: {"query_count": 0, "resolved_ips": set()})
+    for row in rows:
+        row += [""] * (3 - len(row))
+        name, is_response, addrs = row
+        if not name:
+            continue
+        if is_response == "False":
+            queries[name]["query_count"] += 1
+        elif addrs:
+            for a in addrs.split(","):
+                queries[name]["resolved_ips"].add(a.strip())
+
+    return dict(queries)
+
+
 # ---------------------------------------------------------------------------
 # Finding 11: Connection security (TLS vs plaintext vs no-data)
 # ---------------------------------------------------------------------------
@@ -505,33 +575,6 @@ def analyze_connection_security(pcap, proxy_ip, destinations):
 
 
 # ---------------------------------------------------------------------------
-# Finding 10: DNS query analysis
-# ---------------------------------------------------------------------------
-
-def analyze_dns(pcap):
-    """Extract DNS queries and responses."""
-    rows = run_tshark(
-        pcap,
-        ["dns.qry.name", "dns.flags.response", "dns.a"],
-        display_filter="dns",
-    )
-
-    queries = defaultdict(lambda: {"query_count": 0, "resolved_ips": set()})
-    for row in rows:
-        row += [""] * (3 - len(row))
-        name, is_response, addrs = row
-        if not name:
-            continue
-        if is_response == "False":
-            queries[name]["query_count"] += 1
-        elif addrs:
-            for a in addrs.split(","):
-                queries[name]["resolved_ips"].add(a.strip())
-
-    return dict(queries)
-
-
-# ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
 
@@ -592,50 +635,53 @@ def main():
         for e in dns_servers.values():
             print(f"    {e['ip']:<22} {e['total_packets']:>6} pkts")
 
-    # === Finding 2: Destination distribution ===
-    hr("FINDING 2: DESTINATION SERVICE DISTRIBUTION")
-    svc_counts, svc_packets, svc_ips, unmatched = analyze_destination_distribution(destinations)
-    for svc, cnt in svc_counts.most_common():
-        ips_str = ", ".join(svc_ips[svc])
-        print(f"  {svc:<35} {cnt:>2} IP(s)  {svc_packets[svc]:>6} pkts  [{ips_str}]")
-    if unmatched:
-        print(f"\n  Unmatched IPs:")
-        for e in unmatched:
-            print(f"    {e['ip']:<22} {e['total_packets']:>6} pkts")
+    # Enrich all IPs with ASN + geo data (shared by Findings 2 and 3)
+    all_ips = list(destinations.keys()) + list(gateways.keys())
+    print("Enriching IPs (ASN + geolocation)...")
+    ip_info = enrich_ips(all_ips, skip_geo=args.no_geo)
+
+    # === Finding 2: Destination distribution by ASN ===
+    hr("FINDING 2: DESTINATION ASN DISTRIBUTION")
+    asn_counts, asn_packets, asn_ips = analyze_destination_distribution(destinations, ip_info)
+    for asn_label, cnt in asn_counts.most_common():
+        ips_str = ", ".join(asn_ips[asn_label])
+        print(f"  {asn_label:<45} {cnt:>2} IP(s)  {asn_packets[asn_label]:>6} pkts")
+        print(f"    IPs: {ips_str}")
+    print(f"\n  {len(asn_counts)} distinct ASNs across {len(destinations)} destination IPs")
 
     # === Finding 3: Geolocation ===
     hr("FINDING 3: DESTINATION GEOLOCATION")
     if args.no_geo:
-        print("  (skipped with --no-geo)")
+        print("  (geo details skipped with --no-geo; showing country codes from ASN data)")
+        country_counts = Counter()
+        for ip in destinations:
+            cc = ip_info.get(ip, {}).get("countryCode", "?")
+            if cc:
+                country_counts[cc] += 1
+        if country_counts:
+            print(f"\n  Destination countries (from ASN registry):")
+            for cc, cnt in country_counts.most_common():
+                print(f"    {cc:<10} {cnt} IP(s)")
     else:
-        all_ips = list(destinations.keys()) + list(gateways.keys())
-        geo_results = geolocate_ips(all_ips)
-        if geo_results:
+        if ip_info:
             country_counts = Counter()
-            print(f"\n  {'IP':<22} {'Country':<20} {'City':<20} {'Org/AS'}")
+            print(f"\n  {'IP':<22} {'Country':<20} {'City':<20} {'ASN'}")
             print(f"  {'-'*22} {'-'*20} {'-'*20} {'-'*40}")
 
-            # Print gateways first
-            gw_geo = [g for g in geo_results if g.get("query") in gateways]
-            dst_geo = [g for g in geo_results if g.get("query") in destinations]
+            gw_ips_in_info = [ip for ip in gateways if ip in ip_info]
+            dst_ips_in_info = [ip for ip in destinations if ip in ip_info]
 
-            if gw_geo:
+            if gw_ips_in_info:
                 print(f"\n  Gateways:")
-                for g in gw_geo:
-                    cc = g.get("countryCode", "?")
-                    country = g.get("country", "?")
-                    city = g.get("city", "?")
-                    org = g.get("org", "?")
-                    print(f"    {g['query']:<22} {country:<20} {city:<20} {org}")
+                for ip in gw_ips_in_info:
+                    g = ip_info[ip]
+                    print(f"    {ip:<22} {g['country']:<20} {g['city']:<20} {g['as_full']}")
 
             print(f"\n  Destinations:")
-            for g in dst_geo:
-                cc = g.get("countryCode", "?")
-                country = g.get("country", "?")
-                city = g.get("city", "?")
-                org = g.get("org", "?")
-                country_counts[country] += 1
-                print(f"    {g['query']:<22} {country:<20} {city:<20} {org}")
+            for ip in dst_ips_in_info:
+                g = ip_info[ip]
+                country_counts[g["country"]] += 1
+                print(f"    {ip:<22} {g['country']:<20} {g['city']:<20} {g['as_full']}")
 
             print(f"\n  Destination countries summary:")
             for country, cnt in country_counts.most_common():
