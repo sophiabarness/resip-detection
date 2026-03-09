@@ -29,3 +29,7 @@ sudo nsenter -t <PID> -n tcpdump -i any -nn -tt -s 256 -C 100 -W 5 -w /tmp/captu
 (4) (optional) If running on Mac, copy the data back to Mac using `multipass transfer test-vm/tmp/capture.pcap* ~/Desktop`
 
 (5) Read resulting pcap files using tcpdump or wireshark
+
+(6) Merge all files from a provider into one, e.g., mergecap -w honeygain.pcap capture.pcap0 capture.pcap1 capture.pcap2 capture.pcap3
+
+(7) run analysis, e.g., python analyze_pcap.py --pcap honeygain.pcap

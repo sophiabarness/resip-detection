@@ -110,7 +110,7 @@ def classify_ips(pcap, proxy_ip):
     # TLS SNI
     sni_rows = run_tshark(pcap,
                           ["ip.dst", "tls.handshake.extensions_server_name"],
-                          "tls.handshake.type == 1")
+                          f"ip.addr == {proxy_ip} && tls.handshake.type == 1")
     ip_sni = {}
     for row in sni_rows:
         row += [""] * (2 - len(row))
@@ -156,36 +156,54 @@ def enrich_ips(ips, skip_geo=False):
     result = {}
 
     if not skip_geo:
-        # ip-api.com batch (up to 100 IPs) — returns ASN + geo in one call
-        payload = json.dumps([{"query": ip} for ip in ips]).encode()
-        req = urllib.request.Request(
-            "http://ip-api.com/batch?fields=query,country,countryCode,city,org,as",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                for entry in json.loads(resp.read()):
-                    ip = entry.get("query", "")
-                    as_field = entry.get("as", "")
-                    # Parse "AS15169 Google LLC" into number and name
-                    asn, as_name = "", as_field
-                    if as_field.startswith("AS"):
-                        parts = as_field.split(" ", 1)
-                        asn = parts[0]
-                        as_name = parts[1] if len(parts) > 1 else asn
-                    result[ip] = {
-                        "asn": asn,
-                        "as_name": as_name,
-                        "as_full": as_field,
-                        "country": entry.get("country", ""),
-                        "countryCode": entry.get("countryCode", ""),
-                        "city": entry.get("city", ""),
-                        "org": entry.get("org", ""),
-                    }
-        except (urllib.error.URLError, TimeoutError) as e:
-            print(f"  (ip-api.com lookup failed: {e}; falling back to DNS)", file=sys.stderr)
-            skip_geo = True  # fall through to Cymru below
+        # ip-api.com batch (max 100 IPs per request) — returns ASN + geo
+        import time as _time
+        batch_size = 100
+        for i in range(0, len(ips), batch_size):
+            chunk = ips[i:i + batch_size]
+            payload = json.dumps([{"query": ip} for ip in chunk]).encode()
+            req = urllib.request.Request(
+                "http://ip-api.com/batch?fields=query,country,countryCode,city,org,as",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            for attempt in range(3):
+                try:
+                    with urllib.request.urlopen(req, timeout=10) as resp:
+                        for entry in json.loads(resp.read()):
+                            ip = entry.get("query", "")
+                            as_field = entry.get("as", "")
+                            asn, as_name = "", as_field
+                            if as_field.startswith("AS"):
+                                parts = as_field.split(" ", 1)
+                                asn = parts[0]
+                                as_name = parts[1] if len(parts) > 1 else asn
+                            result[ip] = {
+                                "asn": asn,
+                                "as_name": as_name,
+                                "as_full": as_field,
+                                "country": entry.get("country", ""),
+                                "countryCode": entry.get("countryCode", ""),
+                                "city": entry.get("city", ""),
+                                "org": entry.get("org", ""),
+                            }
+                    break  # success
+                except urllib.error.HTTPError as e:
+                    if e.code == 429 and attempt < 2:
+                        _time.sleep(15)  # back off on rate limit
+                        continue
+                    print(f"  (ip-api.com batch {i//batch_size + 1} failed: {e}; falling back to DNS)", file=sys.stderr)
+                    skip_geo = True
+                    break
+                except (urllib.error.URLError, TimeoutError) as e:
+                    print(f"  (ip-api.com batch {i//batch_size + 1} failed: {e}; falling back to DNS)", file=sys.stderr)
+                    skip_geo = True
+                    break
+            if skip_geo:
+                break
+            # Rate limit: ip-api.com allows 15 req/min on free tier
+            if i + batch_size < len(ips):
+                _time.sleep(5)
 
     if skip_geo:
         # Team Cymru DNS-based ASN lookup (stdlib only, no API key needed).
@@ -405,13 +423,13 @@ def analyze_connection_reuse(destinations):
 # Finding 8: TLS fingerprint diversity
 # ---------------------------------------------------------------------------
 
-def analyze_tls_fingerprints(pcap):
+def analyze_tls_fingerprints(pcap, proxy_ip):
     """Extract TLS Client Hello fingerprint variations."""
     rows = run_tshark(
         pcap,
         ["ip.dst", "tls.handshake.version", "tls.handshake.ciphersuite",
          "tls.handshake.extensions_server_name"],
-        display_filter="tls.handshake.type == 1",
+        display_filter=f"ip.addr == {proxy_ip} && tls.handshake.type == 1",
     )
 
     fingerprints = defaultdict(list)
@@ -477,12 +495,12 @@ def analyze_udp_sizes(pcap, proxy_ip, gateways):
 # Finding 10: DNS query analysis
 # ---------------------------------------------------------------------------
 
-def analyze_dns(pcap):
+def analyze_dns(pcap, proxy_ip):
     """Extract DNS queries and responses."""
     rows = run_tshark(
         pcap,
         ["dns.qry.name", "dns.flags.response", "dns.a"],
-        display_filter="dns",
+        display_filter=f"ip.addr == {proxy_ip} && dns",
     )
 
     queries = defaultdict(lambda: {"query_count": 0, "resolved_ips": set()})
@@ -764,7 +782,7 @@ def main():
 
     # === Finding 8: TLS fingerprints ===
     hr("FINDING 8: TLS CLIENT HELLO FINGERPRINT DIVERSITY")
-    tls_fps = analyze_tls_fingerprints(pcap)
+    tls_fps = analyze_tls_fingerprints(pcap, proxy_ip)
     n_fp = len(tls_fps)
     total_hellos = sum(len(v) for v in tls_fps.values())
     print(f"\n  {total_hellos} Client Hellos observed, {n_fp} distinct cipher suite fingerprint(s)")
@@ -818,7 +836,7 @@ def main():
 
     # === Finding 10: DNS ===
     hr("FINDING 10: DNS QUERY ANALYSIS")
-    dns_data = analyze_dns(pcap)
+    dns_data = analyze_dns(pcap, proxy_ip)
     if dns_data:
         print(f"\n  {len(dns_data)} unique domain(s) queried:\n")
         for name, info in sorted(dns_data.items(), key=lambda x: -x[1]["query_count"]):
