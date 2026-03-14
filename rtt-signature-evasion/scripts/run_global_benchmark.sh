@@ -3,7 +3,12 @@ set -e
 
 REGIONS=( "us-west1-b" "us-east1-b" "europe-west4-a" "asia-northeast1-b" "southamerica-east1-a" )
 SERVERS=( "resip-server" "resip-server-east" "resip-server-eu" "resip-server-asia" "resip-server-sa" )
-PROXY_URL="http://UxuBwTn2GSC710Xc:jGQzI2jgfKjxO4Yz@geo.iproyal.com:12321"
+# PROXY_URL should be set in the environment, e.g.:
+# export PROXY_URL="http://user:pass@host:port"
+if [ -z "${PROXY_URL:-}" ]; then
+  echo "Error: PROXY_URL environment variable is not set."
+  exit 1
+fi
 
 for i in "${!REGIONS[@]}"; do
   REGION="${REGIONS[$i]}"
