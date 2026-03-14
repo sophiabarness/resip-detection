@@ -24,7 +24,11 @@ Measurement tools, orchestration scripts, and server configuration.
 
 ## Usage Overview
 1. **Infrastructure**: Deploy the relay and server instances using `setup_global_servers.sh`.
-2. **Measurement**: Run the target experiment using the appropriate shell script (e.g., `run_global_benchmark.sh`).
+2. **Measurement**: Run the target experiment using the appropriate shell script. For the global benchmark, provide the proxy credentials via an environment variable:
+   ```bash
+   export PROXY_URL="http://user:pass@host:port"
+   ./scripts/run_global_benchmark.sh
+   ```
 3. **Evasion**: Enable timing manipulation by running `cloak_daemon.py` on the relay node before starting the client.
 4. **Analysis**: Process the generated PCAPs using `analyze_experiment.py`.
 
