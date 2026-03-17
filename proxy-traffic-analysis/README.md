@@ -18,7 +18,7 @@ docker run honeygain/honeygain -tou-accept -email <EMAIL>  -pass<PASS> -device m
 
 This will start the docker container that proxies all traffic.
 
-(3) In linux, in a separate shell, start tsdump _just for that container_ using nsenter. Honeygain only has one process, so it’s safe to capture all traffic.
+(3) In linux, in a separate shell, start tcpdump _just for that container_ using nsenter. Honeygain only has one process, so it’s safe to capture all traffic.
 
 ```
 docker ls # get all running containers
